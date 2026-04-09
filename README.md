@@ -4,7 +4,8 @@ A RAG-powered tool that lets developers **chat with any Git repository**. Clone 
 
 Built for developer onboarding, code exploration, and codebase documentation.
 
-**Live Demo →** [your-app.streamlit.app](https://your-app.streamlit.app)
+**Live Demo →** https://ai-dev-onboard-platform.streamlit.app
+
 
 ---
 
