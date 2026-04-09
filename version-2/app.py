@@ -338,7 +338,7 @@ if not has_repos:
                             "url": repo_url, "branch": repo_branch,
                             "files": len(docs), "chunks": len(chunks),
                         }
-                        st.session_state.rag_engine = RAGEngine(repo_mgr.get_vectorstore())
+                        st.session_state.rag_engine = RAGEngine(repo_mgr)
                         status.update(label=f"✅ {repo_name} indexed", state="complete")
                     st.rerun()
                 except Exception as e:
@@ -391,7 +391,7 @@ with c1:
                             "url": add_url, "branch": add_branch,
                             "files": len(docs), "chunks": len(chunks),
                         }
-                        st.session_state.rag_engine = RAGEngine(repo_mgr.get_vectorstore())
+                        st.session_state.rag_engine = RAGEngine(repo_mgr)
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ {e}")
@@ -433,7 +433,7 @@ st.markdown('<div style="border-bottom: 1px solid #e5e7eb; margin: 0 -1rem;"></d
 
 # ── RAG engine ───────────────────────────────────────────────────────────────
 if st.session_state.rag_engine is None:
-    st.session_state.rag_engine = RAGEngine(repo_mgr.get_vectorstore())
+    st.session_state.rag_engine = RAGEngine(repo_mgr)
 rag = st.session_state.rag_engine
 
 # ── Empty state ──────────────────────────────────────────────────────────────

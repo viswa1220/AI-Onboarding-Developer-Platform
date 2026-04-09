@@ -3,7 +3,6 @@ import shutil
 from pathlib import Path
 from langchain_community.document_loaders import GitLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 import chromadb
 
@@ -18,23 +17,18 @@ class RepoManager:
         self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=1500,
             chunk_overlap=300,
-            separators=[
-                "\nclass ",
-                "\ndef ",
-                "\n\n",
-                "\n",
-                " ",
-                "",
-            ],
+            separators=["\nclass ", "\ndef ", "\n\n", "\n", " ", ""],
         )
-        self._vectorstore = None
-        # In-memory client — no SQLite, no tenant issues, no locking
-        self._client = chromadb.EphemeralClient()
+        # Pure in-memory ChromaDB — no SQLite, no tenant, no locking
+        self._chroma_client = chromadb.Client()
+        self._collection = self._chroma_client.get_or_create_collection(
+            name="codebase",
+            metadata={"hnsw:space": "cosine"},
+        )
+        self._all_docs = []  # keep raw docs for source display
 
     # ── Clone & load ─────────────────────────────────────────────────────────
-    def clone_and_load(
-        self, clone_url: str, branch: str, file_extensions: list[str]
-    ) -> list:
+    def clone_and_load(self, clone_url: str, branch: str, file_extensions: list[str]) -> list:
         repo_name = clone_url.rstrip("/").split("/")[-1].replace(".git", "")
         repo_path = os.path.join(REPOS_DIR, repo_name)
 
@@ -83,57 +77,66 @@ class RepoManager:
             chunk.metadata["approx_end_line"] = len(lines)
         return chunks
 
-    # ── Sanitize metadata for ChromaDB ───────────────────────────────────────
-    def _sanitize_metadata(self, chunks: list) -> list:
-        for chunk in chunks:
+    # ── Indexing ─────────────────────────────────────────────────────────────
+    def index_chunks(self, chunks: list, collection_name: str = "default"):
+        texts = [c.page_content for c in chunks]
+        ids = [f"{collection_name}_{i}" for i in range(len(self._all_docs), len(self._all_docs) + len(chunks))]
+
+        # Sanitize metadata
+        metadatas = []
+        for c in chunks:
             clean = {}
-            for k, v in chunk.metadata.items():
+            for k, v in c.metadata.items():
                 if v is None:
                     clean[k] = ""
                 elif isinstance(v, (str, int, float, bool)):
                     clean[k] = v
                 else:
                     clean[k] = str(v)
-            chunk.metadata = clean
-        return chunks
+            metadatas.append(clean)
 
-    # ── Indexing ─────────────────────────────────────────────────────────────
-    def index_chunks(self, chunks: list, collection_name: str = "default"):
-        chunks = self._sanitize_metadata(chunks)
+        # Get embeddings from OpenAI
+        embeddings = self.embeddings.embed_documents(texts)
 
-        try:
-            if self._vectorstore is None:
-                self._vectorstore = Chroma.from_documents(
-                    chunks,
-                    embedding=self.embeddings,
-                    client=self._client,
-                    collection_name="codebase",
-                )
-            else:
-                self._vectorstore.add_documents(chunks)
-        except Exception as e:
-            # Reset and retry on any DB error
-            self._vectorstore = None
-            self._client = chromadb.EphemeralClient()
-            try:
-                self._vectorstore = Chroma.from_documents(
-                    chunks,
-                    embedding=self.embeddings,
-                    client=self._client,
-                    collection_name="codebase",
-                )
-            except Exception as retry_err:
-                raise RuntimeError(f"Failed to create vector index: {retry_err}")
+        # Add to ChromaDB directly
+        self._collection.add(
+            ids=ids,
+            documents=texts,
+            embeddings=embeddings,
+            metadatas=metadatas,
+        )
 
-    # ── Access ───────────────────────────────────────────────────────────────
-    def get_vectorstore(self) -> Chroma:
-        if self._vectorstore is None:
-            raise RuntimeError("No vector store found. Index a repo first.")
-        return self._vectorstore
+        self._all_docs.extend(chunks)
+
+    # ── Search ───────────────────────────────────────────────────────────────
+    def search(self, query: str, top_k: int = 8) -> list:
+        """Search the collection and return relevant chunks with metadata."""
+        query_embedding = self.embeddings.embed_query(query)
+
+        results = self._collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(top_k, self._collection.count()),
+            include=["documents", "metadatas"],
+        )
+
+        docs = []
+        if results and results["documents"]:
+            for i, doc_text in enumerate(results["documents"][0]):
+                meta = results["metadatas"][0][i] if results["metadatas"] else {}
+                docs.append({"content": doc_text, "metadata": meta})
+        return docs
+
+    # ── Status ───────────────────────────────────────────────────────────────
+    def is_indexed(self) -> bool:
+        return self._collection.count() > 0
 
     # ── Cleanup ──────────────────────────────────────────────────────────────
     def clear_all(self):
-        self._vectorstore = None
-        self._client = chromadb.EphemeralClient()
+        self._chroma_client = chromadb.Client()
+        self._collection = self._chroma_client.get_or_create_collection(
+            name="codebase",
+            metadata={"hnsw:space": "cosine"},
+        )
+        self._all_docs = []
         if os.path.exists(REPOS_DIR):
             shutil.rmtree(REPOS_DIR)
