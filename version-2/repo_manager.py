@@ -5,9 +5,23 @@ from langchain_community.document_loaders import GitLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
+import chromadb
+from chromadb.config import Settings
 
 REPOS_DIR = "./repos"
 CHROMA_DIR = "./chroma_db"
+
+
+def _get_chroma_client():
+    """Create a ChromaDB client with explicit settings to avoid tenant errors."""
+    os.makedirs(CHROMA_DIR, exist_ok=True)
+    return chromadb.PersistentClient(
+        path=CHROMA_DIR,
+        settings=Settings(
+            anonymized_telemetry=False,
+            allow_reset=True,
+        ),
+    )
 
 
 class RepoManager:
@@ -19,10 +33,10 @@ class RepoManager:
             chunk_size=1500,
             chunk_overlap=300,
             separators=[
-                "\nclass ",     # class boundaries
-                "\ndef ",       # function boundaries
-                "\n\n",         # paragraph breaks
-                "\n",           # line breaks
+                "\nclass ",
+                "\ndef ",
+                "\n\n",
+                "\n",
                 " ",
                 "",
             ],
@@ -36,27 +50,34 @@ class RepoManager:
         repo_name = clone_url.rstrip("/").split("/")[-1].replace(".git", "")
         repo_path = os.path.join(REPOS_DIR, repo_name)
 
-        # Remove old clone if exists
         if os.path.exists(repo_path):
             shutil.rmtree(repo_path)
 
         ext_set = set(file_extensions)
         skip_dirs = {"node_modules", "build", "dist", ".next", "__pycache__", "venv", ".venv", ".git"}
 
-        loader = GitLoader(
-            clone_url=clone_url,
-            repo_path=repo_path,
-            branch=branch,
-            file_filter=lambda fp: (
-                any(fp.endswith(ext) for ext in ext_set)
-                and not any(d in fp for d in skip_dirs)
-                and "package-lock" not in fp
-                and "yarn.lock" not in fp
-            ),
-        )
-        docs = loader.load()
+        try:
+            loader = GitLoader(
+                clone_url=clone_url,
+                repo_path=repo_path,
+                branch=branch,
+                file_filter=lambda fp: (
+                    any(fp.endswith(ext) for ext in ext_set)
+                    and not any(d in fp for d in skip_dirs)
+                    and "package-lock" not in fp
+                    and "yarn.lock" not in fp
+                ),
+            )
+            docs = loader.load()
+        except Exception as e:
+            raise RuntimeError(f"Failed to clone repo: {e}")
 
-        # Enrich metadata
+        if not docs:
+            raise RuntimeError(
+                f"No files found matching {file_extensions} in branch '{branch}'. "
+                "Check the branch name and file types."
+            )
+
         for doc in docs:
             source = doc.metadata.get("source", "")
             doc.metadata["repo"] = repo_name
@@ -67,11 +88,9 @@ class RepoManager:
     # ── Splitting ────────────────────────────────────────────────────────────
     def split_documents(self, docs: list) -> list:
         chunks = self.splitter.split_documents(docs)
-        # Add positional metadata
         for i, chunk in enumerate(chunks):
             chunk.metadata["chunk_index"] = i
-            content = chunk.page_content
-            lines = content.split("\n")
+            lines = chunk.page_content.split("\n")
             chunk.metadata["approx_start_line"] = 1
             chunk.metadata["approx_end_line"] = len(lines)
         return chunks
@@ -93,28 +112,53 @@ class RepoManager:
     # ── Indexing ─────────────────────────────────────────────────────────────
     def index_chunks(self, chunks: list, collection_name: str = "default"):
         chunks = self._sanitize_metadata(chunks)
-        if self._vectorstore is None:
-            self._vectorstore = Chroma.from_documents(
-                chunks,
-                embedding=self.embeddings,
-                persist_directory=CHROMA_DIR,
-                collection_name="codebase",
-            )
-        else:
-            self._vectorstore.add_documents(chunks)
+
+        try:
+            client = _get_chroma_client()
+            if self._vectorstore is None:
+                self._vectorstore = Chroma.from_documents(
+                    chunks,
+                    embedding=self.embeddings,
+                    client=client,
+                    collection_name="codebase",
+                )
+            else:
+                self._vectorstore.add_documents(chunks)
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "readonly" in error_msg or "tenant" in error_msg or "database" in error_msg:
+                self._vectorstore = None
+                if os.path.exists(CHROMA_DIR):
+                    shutil.rmtree(CHROMA_DIR)
+                try:
+                    client = _get_chroma_client()
+                    self._vectorstore = Chroma.from_documents(
+                        chunks,
+                        embedding=self.embeddings,
+                        client=client,
+                        collection_name="codebase",
+                    )
+                except Exception as retry_err:
+                    raise RuntimeError(f"Failed to create vector index after retry: {retry_err}")
+            else:
+                raise RuntimeError(f"Indexing failed: {e}")
 
     # ── Access ───────────────────────────────────────────────────────────────
     def get_vectorstore(self) -> Chroma:
         if self._vectorstore is None:
-            # Try loading from disk
             if os.path.exists(CHROMA_DIR):
-                self._vectorstore = Chroma(
-                    persist_directory=CHROMA_DIR,
-                    embedding_function=self.embeddings,
-                    collection_name="codebase",
-                )
+                try:
+                    client = _get_chroma_client()
+                    self._vectorstore = Chroma(
+                        client=client,
+                        embedding_function=self.embeddings,
+                        collection_name="codebase",
+                    )
+                except Exception:
+                    shutil.rmtree(CHROMA_DIR)
+                    raise RuntimeError("Vector database was corrupted and has been reset. Please re-index your repos.")
             else:
-                raise ValueError("No vector store found. Index a repo first.")
+                raise RuntimeError("No vector store found. Index a repo first.")
         return self._vectorstore
 
     # ── Cleanup ──────────────────────────────────────────────────────────────
