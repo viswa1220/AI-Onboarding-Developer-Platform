@@ -6,22 +6,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 import chromadb
-from chromadb.config import Settings
 
 REPOS_DIR = "./repos"
-CHROMA_DIR = "./chroma_db"
-
-
-def _get_chroma_client():
-    """Create a ChromaDB client with explicit settings to avoid tenant errors."""
-    os.makedirs(CHROMA_DIR, exist_ok=True)
-    return chromadb.PersistentClient(
-        path=CHROMA_DIR,
-        settings=Settings(
-            anonymized_telemetry=False,
-            allow_reset=True,
-        ),
-    )
 
 
 class RepoManager:
@@ -42,6 +28,8 @@ class RepoManager:
             ],
         )
         self._vectorstore = None
+        # In-memory client — no SQLite, no tenant issues, no locking
+        self._client = chromadb.EphemeralClient()
 
     # ── Clone & load ─────────────────────────────────────────────────────────
     def clone_and_load(
@@ -114,57 +102,38 @@ class RepoManager:
         chunks = self._sanitize_metadata(chunks)
 
         try:
-            client = _get_chroma_client()
             if self._vectorstore is None:
                 self._vectorstore = Chroma.from_documents(
                     chunks,
                     embedding=self.embeddings,
-                    client=client,
+                    client=self._client,
                     collection_name="codebase",
                 )
             else:
                 self._vectorstore.add_documents(chunks)
         except Exception as e:
-            error_msg = str(e).lower()
-            if "readonly" in error_msg or "tenant" in error_msg or "database" in error_msg:
-                self._vectorstore = None
-                if os.path.exists(CHROMA_DIR):
-                    shutil.rmtree(CHROMA_DIR)
-                try:
-                    client = _get_chroma_client()
-                    self._vectorstore = Chroma.from_documents(
-                        chunks,
-                        embedding=self.embeddings,
-                        client=client,
-                        collection_name="codebase",
-                    )
-                except Exception as retry_err:
-                    raise RuntimeError(f"Failed to create vector index after retry: {retry_err}")
-            else:
-                raise RuntimeError(f"Indexing failed: {e}")
+            # Reset and retry on any DB error
+            self._vectorstore = None
+            self._client = chromadb.EphemeralClient()
+            try:
+                self._vectorstore = Chroma.from_documents(
+                    chunks,
+                    embedding=self.embeddings,
+                    client=self._client,
+                    collection_name="codebase",
+                )
+            except Exception as retry_err:
+                raise RuntimeError(f"Failed to create vector index: {retry_err}")
 
     # ── Access ───────────────────────────────────────────────────────────────
     def get_vectorstore(self) -> Chroma:
         if self._vectorstore is None:
-            if os.path.exists(CHROMA_DIR):
-                try:
-                    client = _get_chroma_client()
-                    self._vectorstore = Chroma(
-                        client=client,
-                        embedding_function=self.embeddings,
-                        collection_name="codebase",
-                    )
-                except Exception:
-                    shutil.rmtree(CHROMA_DIR)
-                    raise RuntimeError("Vector database was corrupted and has been reset. Please re-index your repos.")
-            else:
-                raise RuntimeError("No vector store found. Index a repo first.")
+            raise RuntimeError("No vector store found. Index a repo first.")
         return self._vectorstore
 
     # ── Cleanup ──────────────────────────────────────────────────────────────
     def clear_all(self):
         self._vectorstore = None
-        if os.path.exists(CHROMA_DIR):
-            shutil.rmtree(CHROMA_DIR)
+        self._client = chromadb.EphemeralClient()
         if os.path.exists(REPOS_DIR):
             shutil.rmtree(REPOS_DIR)
