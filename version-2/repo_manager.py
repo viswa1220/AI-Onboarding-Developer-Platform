@@ -1,10 +1,11 @@
 import os
 import shutil
+import numpy as np
 from pathlib import Path
 from langchain_community.document_loaders import GitLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
-import chromadb
+import faiss
 
 REPOS_DIR = "./repos"
 
@@ -19,13 +20,10 @@ class RepoManager:
             chunk_overlap=300,
             separators=["\nclass ", "\ndef ", "\n\n", "\n", " ", ""],
         )
-        # Pure in-memory ChromaDB — no SQLite, no tenant, no locking
-        self._chroma_client = chromadb.Client()
-        self._collection = self._chroma_client.get_or_create_collection(
-            name="codebase",
-            metadata={"hnsw:space": "cosine"},
-        )
-        self._all_docs = []  # keep raw docs for source display
+        self._index = None       # FAISS index
+        self._texts = []         # stored chunk texts
+        self._metadatas = []     # stored chunk metadata
+        self._dimension = None
 
     # ── Clone & load ─────────────────────────────────────────────────────────
     def clone_and_load(self, clone_url: str, branch: str, file_extensions: list[str]) -> list:
@@ -80,7 +78,6 @@ class RepoManager:
     # ── Indexing ─────────────────────────────────────────────────────────────
     def index_chunks(self, chunks: list, collection_name: str = "default"):
         texts = [c.page_content for c in chunks]
-        ids = [f"{collection_name}_{i}" for i in range(len(self._all_docs), len(self._all_docs) + len(chunks))]
 
         # Sanitize metadata
         metadatas = []
@@ -95,48 +92,52 @@ class RepoManager:
                     clean[k] = str(v)
             metadatas.append(clean)
 
-        # Get embeddings from OpenAI
-        embeddings = self.embeddings.embed_documents(texts)
+        # Embed
+        emb_list = self.embeddings.embed_documents(texts)
+        emb_array = np.array(emb_list, dtype=np.float32)
 
-        # Add to ChromaDB directly
-        self._collection.add(
-            ids=ids,
-            documents=texts,
-            embeddings=embeddings,
-            metadatas=metadatas,
-        )
+        # Create or add to FAISS index
+        if self._index is None:
+            self._dimension = emb_array.shape[1]
+            self._index = faiss.IndexFlatIP(self._dimension)  # inner product (cosine with normalized vecs)
 
-        self._all_docs.extend(chunks)
+        # Normalize for cosine similarity
+        faiss.normalize_L2(emb_array)
+        self._index.add(emb_array)
+        self._texts.extend(texts)
+        self._metadatas.extend(metadatas)
 
     # ── Search ───────────────────────────────────────────────────────────────
     def search(self, query: str, top_k: int = 8) -> list:
-        """Search the collection and return relevant chunks with metadata."""
-        query_embedding = self.embeddings.embed_query(query)
+        if self._index is None or self._index.ntotal == 0:
+            return []
 
-        results = self._collection.query(
-            query_embeddings=[query_embedding],
-            n_results=min(top_k, self._collection.count()),
-            include=["documents", "metadatas"],
-        )
+        query_emb = np.array([self.embeddings.embed_query(query)], dtype=np.float32)
+        faiss.normalize_L2(query_emb)
 
-        docs = []
-        if results and results["documents"]:
-            for i, doc_text in enumerate(results["documents"][0]):
-                meta = results["metadatas"][0][i] if results["metadatas"] else {}
-                docs.append({"content": doc_text, "metadata": meta})
-        return docs
+        k = min(top_k, self._index.ntotal)
+        scores, indices = self._index.search(query_emb, k)
+
+        results = []
+        for i, idx in enumerate(indices[0]):
+            if idx < 0:
+                continue
+            results.append({
+                "content": self._texts[idx],
+                "metadata": self._metadatas[idx],
+                "score": float(scores[0][i]),
+            })
+        return results
 
     # ── Status ───────────────────────────────────────────────────────────────
     def is_indexed(self) -> bool:
-        return self._collection.count() > 0
+        return self._index is not None and self._index.ntotal > 0
 
     # ── Cleanup ──────────────────────────────────────────────────────────────
     def clear_all(self):
-        self._chroma_client = chromadb.Client()
-        self._collection = self._chroma_client.get_or_create_collection(
-            name="codebase",
-            metadata={"hnsw:space": "cosine"},
-        )
-        self._all_docs = []
+        self._index = None
+        self._texts = []
+        self._metadatas = []
+        self._dimension = None
         if os.path.exists(REPOS_DIR):
             shutil.rmtree(REPOS_DIR)
