@@ -4,8 +4,7 @@ A RAG-powered tool that lets developers **chat with any Git repository**. Clone 
 
 Built for developer onboarding, code exploration, and codebase documentation.
 
-**Live Demo →** https://ai-dev-onboard-platform.streamlit.app
-
+**Live Demo →** [ai-dev-onboard-platform.streamlit.app](https://ai-dev-onboard-platform.streamlit.app/)
 
 ---
 
@@ -40,29 +39,27 @@ Built for developer onboarding, code exploration, and codebase documentation.
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────┐
-│                   Streamlit UI                        │
-│  ┌─────────────┐  ┌──────────┐  ┌─────────────────┐ │
-│  │ Setup Screen │  │  Navbar  │  │  Chat Interface  │ │
-│  └──────┬──────┘  └────┬─────┘  └────────┬────────┘ │
-└─────────┼──────────────┼─────────────────┼──────────┘
-          │              │                 │
-          ▼              │                 ▼
-   ┌─────────────┐       │          ┌─────────────┐
-   │ RepoManager │       │          │  RAGEngine   │
-   │             │       │          │              │
-   │ • Clone     │       │          │ • Retrieve   │
-   │ • Chunk     │       │          │ • Rewrite Q  │
-   │ • Embed     │       │          │ • Generate   │
-   │ • Index     │       │          │ • Cite       │
-   └──────┬──────┘       │          └──────┬───────┘
-          │              │                 │
-          ▼              │                 ▼
-   ┌─────────────┐       │          ┌─────────────┐
-   │  ChromaDB   │◄──────┘          │  OpenAI API │
-   │ (Vector DB) │                  │ (GPT-4o)    │
-   └─────────────┘                  └─────────────┘
+```mermaid
+flowchart TB
+    U["Developer"] --> UI["Streamlit UI<br/>setup · navbar · chat"]
+
+    subgraph Indexing["Indexing · RepoManager"]
+        RM["Clone repo · GitPython<br/>load files → code-aware chunking"] --> EMB["Embed chunks<br/>text-embedding-3-small"]
+        EMB --> VDB[("ChromaDB<br/>vector store")]
+    end
+
+    subgraph Query["Query · RAGEngine"]
+        RW["Rewrite to standalone question<br/>GPT-4o"] --> RET["Retrieve · MMR<br/>diverse, relevant chunks"]
+        RET --> GEN["Generate answer + citations<br/>GPT-4o"]
+    end
+
+    UI -->|"index a repo"| RM
+    UI -->|"ask a question"| RW
+    VDB --> RET
+    GEN --> UI
+    EMB -.->|embeddings| OAI["OpenAI API"]
+    RW -.-> OAI
+    GEN -.-> OAI
 ```
 
 ---
